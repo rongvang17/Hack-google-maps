@@ -21,6 +21,8 @@ def get_color():
     list_color.append(yellow)
     list_color.append(blue)
     list_color.append(pink)
+    
+    print('ao that day')
 
     return list_color
 
