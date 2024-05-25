@@ -224,11 +224,8 @@ def process_images_in_folder(images_path, labels_path):
     global list_box_icon
     image_files = os.listdir(images_path)
 
-    cnt = 5
-
     for image_file in image_files:
 
-        if cnt > 0:
             image_path = os.path.join(images_path, image_file)
 
             if os.path.isfile(image_path) and image_path.lower().endswith(('png', 'jpg', 'jpeg')):
@@ -266,7 +263,6 @@ def process_images_in_folder(images_path, labels_path):
                 else:
                     print(f'no find label file {img_name}.txt')
 
-            cnt -= 1
             index_color = 0
 
     print("Total excute time :", time.time() - start, "s")
