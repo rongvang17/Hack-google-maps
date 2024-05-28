@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import os
 import time
-import list_colors
+import torch
 
 from paddleocr import PaddleOCR
 
@@ -35,7 +35,7 @@ def remove_icon(input_image, label_path):
 
     height, width, chanel = input_image.shape
     crop_icon_img = input_image
-    list_box_icon = []
+    temp_list_box_icon = []
 
     with open(label_path, 'r') as file:
         lines = file.readlines()
@@ -49,10 +49,10 @@ def remove_icon(input_image, label_path):
         bottom = int((y_center + box_height / 2) * height)
         coord = (left, top, right, bottom)
 
-        list_box_icon.append(coord)
+        temp_list_box_icon.append(coord)
         crop_icon_img[top:bottom, left:right] = (255, 255, 255)
 
-    return crop_icon_img, list_box_icon
+    return crop_icon_img, temp_list_box_icon
 
 
 # combined detect box
@@ -85,7 +85,7 @@ def combine_box(input_image):
             cv2.rectangle(mask, (l, t), (r, b), (255, 255, 255), -1)
 
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        kernel = np.ones((3, 1), np.uint8)
+        kernel = np.ones((4, 1), np.uint8)
         dilate_img = cv2.dilate(mask, kernel)
         contours, hierarchy = cv2.findContours(dilate_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
@@ -101,8 +101,9 @@ def color_classification(input_img, color):
     gray_image = cv2.inRange(hsv, lower_color, upper_color)
 
     res = cv2.bitwise_and(input_img,input_img, mask= gray_image)
-    # gray_img_last = cv2.cvtColor(res, cv2.COLOR_BGR2GRAY)
+    black_mask = np.all(res == [0, 0, 0], axis=2)
 
+    res[black_mask] = [255, 255, 255]
     return res
 
 
@@ -122,16 +123,18 @@ def get_text_information(input_image):
 
         for contour in contours:
 
-            [X, Y, W, H] = cv2.boundingRect(contour)
-            text_coord = (X, Y, X+W, Y+H)
+            if cv2.contourArea(contour) > 20:
 
-            crop_image = temp_image[Y:(Y+H), X:(X+W)]
+                [X, Y, W, H] = cv2.boundingRect(contour)
+                text_coord = (X, Y, X+W, Y+H)
 
-            agument_img = agument_image(crop_image)
-            result = reader.readtext(agument_img, detail=1, paragraph=True)
+                crop_image = temp_image[Y:(Y+H), X:(X+W)]
 
-            for _, text in result:
-                list_box_text.append((text_coord, text))
+                agument_img = agument_image(crop_image)
+                result = reader.readtext(agument_img, detail=1, paragraph=True)
+
+                for _, text in result:
+                    list_box_text.append((text_coord, text))
 
         return list_box_text
 
@@ -139,41 +142,35 @@ def get_text_information(input_image):
 # return status distance, min distance
 def get_coord_min(boxtt, boxlb, max_distance):
 
-    data_list = []
+    boxtt = torch.tensor(boxtt)
+    boxlb = torch.tensor(boxlb)
+    max_distance = torch.tensor(max_distance)
+
     x_left_label, y_top_label, x_right_label, y_bottom_label = boxlb
     x_left_text, y_top_text, x_right_text, y_bottom_text = boxtt
-    x1 = (x_left_label, int((y_top_label + y_bottom_label) / 2))
-    x2 = (int((x_left_label + x_right_label) / 2), y_top_label)
-    x3 = (x_right_label, int((y_top_label + y_bottom_label) / 2))
-    x4 = (int((x_left_label + x_right_label) / 2), y_bottom_label)
 
-    data_list.append(x1)
-    data_list.append(x2)
-    data_list.append(x3)
-    data_list.append(x4)
+    
 
-    temp = 1e+8
-    check_distance = False
-    for data in data_list:
-        x_min = min(abs(data[0] - x_left_text), abs(data[0] - x_right_text))
-        y_min = min(abs(data[1] - y_top_text), abs(data[1] - y_bottom_text))
+    x_label_center, y_label_center = (x_left_label + x_right_label) / 2, (y_top_label + y_bottom_label) / 2
 
-        if (x_min <= max_distance) and (y_min <= max_distance):
+    x_distance, y_distance = torch.abs(x_label_center - torch.tensor([x_left_text, x_right_text])), torch.abs(y_label_center - torch.tensor([y_top_text, y_bottom_text]))
 
-            check_distance = True
-            key = x_min + y_min
-            temp = min(temp, key)
+    x_min, y_min = torch.min(x_distance), torch.min(y_distance)
+    check_distance = (x_min <= max_distance) and (y_min <= max_distance)
+    check_place = (x_left_text <= x_label_center <= x_right_text) or (y_top_text <= y_label_center <= y_bottom_text)
 
-    dis_min = temp
+    if check_distance and check_place:
 
-    return check_distance, dis_min
+        return check_distance, (x_min.item() + y_min.item())
+    
+    return False, 0
 
 
 def combine_text_box(list_box_text):
 
     list_value = []
     new_list_box_text = []
-    max_distance = 20
+    max_distance = 65
 
     global list_box_icon
 
@@ -190,7 +187,7 @@ def combine_text_box(list_box_text):
             status, dis_temp = get_coord_min(boxtt[0], boxlb, max_distance)
             if status:
                 my_check = True
-                if dis_temp <= dis_min:
+                if dis_temp < dis_min:
                     dis_min = dis_temp
                     min_index = ilb
             else:
@@ -202,13 +199,13 @@ def combine_text_box(list_box_text):
             x_circle, y_circle = int((x_left_label + x_right_label) / 2), y_bottom_label
             get_value = (x_circle, y_circle, text_text)
             list_value.append(get_value)
-            list_box_icon.pop(min_index)
+            # list_box_icon.pop(min_index)
 
     return list_value
 
 def save_xy_text(output_folder, txt_name, values):
 
-    with open(os.path.join(output_folder, txt_name), 'w') as file:
+    with open(os.path.join(output_folder, txt_name), 'a') as file:
 
         for value in values:
 
@@ -220,19 +217,19 @@ def save_xy_text(output_folder, txt_name, values):
 def process_images_in_folder(images_path, labels_path):
 
     global list_color
-    global index_color
     global list_box_icon
+    global cnt
     image_files = os.listdir(images_path)
 
     for image_file in image_files:
 
+        if cnt > 0:
             image_path = os.path.join(images_path, image_file)
 
-            if os.path.isfile(image_path) and image_path.lower().endswith(('png', 'jpg', 'jpeg')):
+            if os.path.isfile(image_path) and image_path.lower().endswith(('png')):
 
                 input_img = cv2.imread(image_path)
                 img_name = os.path.splitext(image_file)[0]
-                print('image_name:', img_name)
                 label_path = os.path.join(labels_path, img_name + '.txt')
 
                 if os.path.exists(label_path):
@@ -244,12 +241,13 @@ def process_images_in_folder(images_path, labels_path):
                     list_box_icon = box_icon
 
                     if list_box_icon[0] is None:
-                        print(f"image {image_file} no has information")
-
+                        print(f"image {image_file} has no icon")
                     else:
+                        
                         for color in list_color:
 
                             list_box_text = []
+
                             # image for each label
                             classification_img = color_classification(crop_icon_image, color)
                             infor = get_text_information(classification_img) # return text coord, text
@@ -260,72 +258,72 @@ def process_images_in_folder(images_path, labels_path):
                             txt_name = img_name + '.txt'
                             save_xy_text(output_data, txt_name, value)
 
+                    cv2.waitKey(0)
+
                 else:
                     print(f'no find label file {img_name}.txt')
 
-            index_color = 0
+        cnt -= 1
+        
+    print(f"Total excute time: {time.time() - start}s")
 
-    print("Total excute time :", time.time() - start, "s")
+# images_path = '/home/minhthanh/Desktop/test_temp_img/' # test image
+# labels_path = '/home/minhthanh/Desktop/test_temp_label/'
+# output_data = '/home/minhthanh/Desktop/lat_long_text_temp/' # save lat, long, text
 
-
-images_path = '/home/minhthanh/Desktop/images_labels/images/' # test image
-labels_path = '/home/minhthanh/Desktop/images_labels/labels/'
-output_data = '/home/minhthanh/Desktop/lat_long_text/' # save lat, long, text
+images_path = '/home/minhthanh/Desktop/advanced_images/save_images/' # test image
+labels_path = '/home/minhthanh/Desktop/advanced_images/save_labels/'
+output_data = '/home/minhthanh/Desktop/advanced_images/lat_long-text/'
 
 # get list color detected
-list_color = list_colors.get_color()
+list_color = []
+# food store
+lower_yellow = np.array([15,118,211])
+upper_yellow = np.array([16,255,233])
 
-colors = [
-    (255, 0, 0),    # blue
-    (0, 255, 0),    # green
-    (0, 0, 255),    # red
-    (255, 255, 0),  # cyan
-    (255, 0, 255),  # magenta
-    (0, 255, 255),  # yellow
-    (128, 0, 0),    # navy
-    (0, 128, 0),    # dark green
-    (0, 0, 128),    # dark red
-    (128, 128, 0),  # olive
-    (128, 0, 128),  # purple
-    (0, 128, 128),  # teal
-    (255, 165, 0),  # orange
-    (128, 128, 128),# gray
-    (0, 0, 0),      # black
-    (255, 0, 0),    # blue
-    (0, 255, 0),    # green
-    (0, 0, 255),    # red
-    (255, 255, 0),  # cyan
-    (255, 0, 255),  # magenta
-    (0, 255, 255),  # yellow
-    (128, 0, 0),    # navy
-    (0, 128, 0),    # dark green
-    (0, 0, 128),    # dark red
-    (128, 128, 0),  # olive
-    (128, 0, 128),  # purple
-    (0, 128, 128),  # teal
-    (255, 165, 0),  # orange
-    (128, 128, 128),# gray
-    (0, 0, 0),
-    (255, 0, 0),    # blue
-    (0, 255, 0),    # green
-    (0, 0, 255),    # red
-    (255, 255, 0),  # cyan
-    (255, 0, 255),  # magenta
-    (0, 255, 255),  # yellow
-    (128, 0, 0),    # navy
-    (0, 128, 0),    # dark green
-    (0, 0, 128),    # dark red
-    (128, 128, 0),  # olive
-    (128, 0, 128),  # purple
-    (0, 128, 128),  # teal
-    (255, 165, 0),  # orange
-    (128, 128, 128),# gray
-    (0, 0, 0)
-]
-index_color = 0
+# closing store
+lower_blue = np.array([107,77,231])
+upper_blue = np.array([109,229,245])
 
+# company
+lower_gray = np.array([95,17,118])
+upper_gray = np.array([101,91,196])
+
+# hotel
+lower_pink = np.array([168,57,231])
+upper_pink = np.array([171,224,249])
+
+# pharmacity
+lower_red = np.array([1,95,215])
+upper_red = np.array([3,213,237])
+
+# musume
+lower_greenblue = np.array([92,69,143])
+upper_greenblue = np.array([94,243,206])
+
+# bank
+lower_bank = np.array([114,90,191])
+upper_bank = np.array([117,135,222])
+
+
+yellow = (lower_yellow, upper_yellow)
+blue = (lower_blue, upper_blue)
+gray = (lower_gray, upper_gray)
+pink = (lower_pink, upper_pink)
+red = (lower_red, upper_red)
+greenblue = (lower_greenblue, upper_greenblue)
+bank = (lower_bank, upper_bank)
+
+list_color.append(yellow)
+list_color.append(blue)
+list_color.append(gray)
+list_color.append(pink)
+list_color.append(red)
+list_color.append(greenblue)
+list_color.append(bank)
 
 # inference all
 if __name__ == "__main__":
 
     process_images_in_folder(images_path, labels_path)
+
