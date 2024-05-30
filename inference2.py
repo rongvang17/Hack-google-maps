@@ -4,17 +4,21 @@ import numpy as np
 import os
 import time
 import torch
+import json
 
 from paddleocr import PaddleOCR
 
 
-start = time.time()
-
-reader = easyocr.Reader(['en', 'vi'], gpu=False) # read text by Easyocr
-ocr = PaddleOCR(use_angle_cls=False, use_gpu=False, lang='vi', dilation=True,  # get box text by Paddleocr
+reader = easyocr.Reader(['en', 'vi'], gpu=False) # read text by use Easyocr
+ocr = PaddleOCR(use_angle_cls=False, use_gpu=False, lang='vi', dilation=True, # detect box text by use PaddleOCR
                 det_db_box_thresh=0.5, det_limit_side_len=2200, use_dilation=True, 
                 det_east_nms_thresh=0.6, det_sast_nms_thresh=0.6) 
 
+# detect icon use yolov5
+model = torch.hub.load("yolov5", "custom", path="last.pt", source="local")  # local repo
+model.conf = 0.8
+model.max_det = 1000
+model.cpu()
 
 # agument image
 def agument_image(bgr_image):
@@ -30,33 +34,8 @@ def agument_image(bgr_image):
     return agument_img
 
 
-# remove icon
-def remove_icon(input_image, label_path):
-
-    height, width, chanel = input_image.shape
-    crop_icon_img = input_image
-    temp_list_box_icon = []
-
-    with open(label_path, 'r') as file:
-        lines = file.readlines()
-
-    for line in lines:
-        class_id, x_center, y_center, box_width, box_height = map(float, line.split())
-
-        left = int((x_center - box_width / 2) * width)
-        top = int((y_center - box_height / 2) * height)
-        right = int((x_center + box_width / 2) * width)
-        bottom = int((y_center + box_height / 2) * height)
-        coord = (left, top, right, bottom)
-
-        temp_list_box_icon.append(coord)
-        crop_icon_img[top:bottom, left:right] = (255, 255, 255)
-
-    return crop_icon_img, temp_list_box_icon
-
-
-# combined detect box
-def combine_box(input_image):
+# combined detect box text
+def combine_box_text(input_image):
 
     mask = np.zeros_like(input_image, dtype=np.uint8)
 
@@ -91,7 +70,7 @@ def combine_box(input_image):
 
         return contours
 
-        
+
 # get color classification
 def color_classification(input_img, color):
 
@@ -114,16 +93,14 @@ def get_text_information(input_image):
 
     temp_image = input_image
     
-    contours = combine_box(input_image)
+    contours = combine_box_text(input_image)
     if contours is None:
         print("images has icon but no text")
         return
 
     else:
-
         for contour in contours:
-
-            if cv2.contourArea(contour) > 20:
+            if cv2.contourArea(contour) > 25:
 
                 [X, Y, W, H] = cv2.boundingRect(contour)
                 text_coord = (X, Y, X+W, Y+H)
@@ -139,40 +116,14 @@ def get_text_information(input_image):
         return list_box_text
 
 
-# return status distance, min distance
-def get_coord_min(boxtt, boxlb, max_distance):
+def combine_text_box(list_box_text, img_name):
 
-    boxtt = torch.tensor(boxtt)
-    boxlb = torch.tensor(boxlb)
-    max_distance = torch.tensor(max_distance)
-
-    x_left_label, y_top_label, x_right_label, y_bottom_label = boxlb
-    x_left_text, y_top_text, x_right_text, y_bottom_text = boxtt
-
-    
-
-    x_label_center, y_label_center = (x_left_label + x_right_label) / 2, (y_top_label + y_bottom_label) / 2
-
-    x_distance, y_distance = torch.abs(x_label_center - torch.tensor([x_left_text, x_right_text])), torch.abs(y_label_center - torch.tensor([y_top_text, y_bottom_text]))
-
-    x_min, y_min = torch.min(x_distance), torch.min(y_distance)
-    check_distance = (x_min <= max_distance) and (y_min <= max_distance)
-    check_place = (x_left_text <= x_label_center <= x_right_text) or (y_top_text <= y_label_center <= y_bottom_text)
-
-    if check_distance and check_place:
-
-        return check_distance, (x_min.item() + y_min.item())
-    
-    return False, 0
-
-
-def combine_text_box(list_box_text):
+    global list_box_icon
+    global exception_path
+    global check_used_icon
 
     list_value = []
     new_list_box_text = []
-    max_distance = 65
-
-    global list_box_icon
 
     for list in list_box_text:
 
@@ -184,7 +135,7 @@ def combine_text_box(list_box_text):
         min_index = 0
         my_check = False
         for ilb, boxlb in enumerate(list_box_icon):
-            status, dis_temp = get_coord_min(boxtt[0], boxlb, max_distance)
+            status, dis_temp = get_coord_min(boxtt[0], boxlb)
             if status:
                 my_check = True
                 if dis_temp < dis_min:
@@ -199,7 +150,136 @@ def combine_text_box(list_box_text):
             x_circle, y_circle = int((x_left_label + x_right_label) / 2), y_bottom_label
             get_value = (x_circle, y_circle, text_text)
             list_value.append(get_value)
-            # list_box_icon.pop(min_index)
+
+            if check_used_icon[min_index] == 1:
+                txt_name = img_name + '.txt'
+                with open(os.path.join(exception_path, txt_name), 'a') as file:
+                    file.write(f"{x_circle},{y_circle},{text_text}\n")
+            else:
+                check_used_icon[min_index] = 1
+
+    return list_value
+
+
+# return status distance, min distance
+def combine_text_box2(list_box_text, img_name):
+
+    global list_box_icon
+    global exception_path
+    global check_used_icon
+
+    # list_box_icon_tensor = torch.tensor(list_box_icon, dtype=torch.float16).cuda()
+    # list_box_text_tensor = torch.tensor(list_box_text, dtype=torch.float16).cuda()
+
+    list_value = []
+    x_distance = []
+    y_distance = []
+
+    for ilb, boxlb in enumerate(list_box_icon):
+        x_left_label, y_top_label, x_right_label, y_bottom_label = boxlb
+        x_label_center, y_label_center = (x_left_label + x_right_label) / 2, (y_top_label + y_bottom_label) / 2
+
+        check_save = False
+        x_min = 1e+5
+        y_min = 1e+5
+        x_index = 0
+        y_index = 0
+
+        for itt, boxtt in enumerate(list_box_text):
+            x_left_text, y_top_text, x_right_text, y_bottom_text = boxtt[0]
+            x_dis = (x_left_text <= x_label_center <= x_right_text)
+            y_dis = (y_top_text <= y_label_center <= y_bottom_text)
+
+            if x_dis:
+                y = min(abs(y_label_center - y_top_text), abs(y_label_center - y_bottom_text))
+                if y < y_min and y < 44:
+                    y_min = y
+                    y_index = itt
+                    check_save = True
+            if y_dis:
+                x = min(abs(x_label_center - x_left_text), abs(x_label_center - x_right_text))
+                if x < x_min and x < 44:
+                    x_min = x
+                    x_index = itt
+                    check_save = True
+        print(x_min, y_min)
+        if check_save:
+            if y_min < x_min:
+                index_text = y_index
+            else:
+                index_text = x_index
+
+            text_text = list_box_text[index_text][1]
+            x_circle, y_circle = int((x_left_label + x_right_label) / 2), y_bottom_label
+            get_value = (x_circle, y_circle, text_text)
+            list_value.append(get_value)
+
+            if check_used_icon[ilb] == 1:
+                txt_name = img_name + '.txt'
+                with open(os.path.join(exception_path, txt_name), 'a') as file:
+                    file.write(f"{x_circle},{y_circle},{text_text}\n")
+            else:
+                check_used_icon[ilb] = 1
+
+    return list_value
+
+def combine_text_box3(list_box_text, img_name):
+
+    global list_box_icon
+    global exception_path
+    global check_used_icon
+
+    list_value = []
+    x_distance = []
+    y_distance = []
+
+    list_box_icon_tensor = torch.tensor(list_box_icon, dtype=torch.float32).cuda() # upload to gpu
+    list_box_text_tensor = torch.tensor([box[0] for box in list_box_text], dtype=torch.float32).cuda() # upload to gpu
+
+    for ilb, boxlb in enumerate(list_box_icon_tensor):
+        x_label_center, y_label_center = (boxlb[0] + boxlb[2]) / 2, (boxlb[1] + boxlb[3]) / 2
+
+        check_save = False
+        x_min = 1e+5
+        y_min = 1e+5
+        x_index = 0
+        y_index = 0
+
+        for itt, boxtt in enumerate(list_box_text_tensor):
+            x_left_text, y_top_text, x_right_text, y_bottom_text = boxtt
+            x_dis = (x_left_text <= x_label_center <= x_right_text)
+            y_dis = (y_top_text <= y_label_center <= y_bottom_text)
+
+            if x_dis:
+                y = min(abs(y_label_center - y_top_text), abs(y_label_center - y_bottom_text))
+                if y < y_min and y < 45:
+                    y_min = y
+                    y_index = itt
+                    check_save = True
+            if y_dis:
+                x = min(abs(x_label_center - x_left_text), abs(x_label_center - x_right_text))
+                if x < x_min and x < 45:
+                    x_min = x
+                    x_index = itt
+                    check_save = True
+
+        if check_save:
+            if y_min < x_min:
+                index_text = y_index
+            else:
+                index_text = x_index
+
+            text_text = list_box_text[index_text][1]
+            x_circle, y_circle = int((boxlb[0] + boxlb[2]) / 2), boxlb[3]
+            get_value = (x_circle, y_circle, text_text)
+            list_value.append(get_value)
+
+            if check_used_icon[ilb] == 1:
+                txt_name = img_name + '.txt'
+                with open(os.path.join(exception_path, txt_name), 'a') as file:
+                    file.write(f"{x_circle},{y_circle},{text_text}\n")
+            else:
+                check_used_icon[ilb] = 1
 
     return list_value
 
@@ -208,74 +288,81 @@ def save_xy_text(output_folder, txt_name, values):
     with open(os.path.join(output_folder, txt_name), 'a') as file:
 
         for value in values:
-
             xi, yi, text = value
             file.write(f"{xi},{yi},{text}\n")
 
-        
+
+# get box icon by yolov5
+def get_box_icon(image_path):
+
+    crop_icon_img = cv2.imread(image_path)
+    results = model(image_path)
+    data = results.pandas().xyxy[0].to_json(orient="records")  # JSON img1 predictions
+    json_data = json.loads(data)
+
+    if not json_data:
+        return image_path, []
+
+    list_box_yolov5 = []
+    for record in json_data:
+        value = (int(record['xmin']), int(record['ymin']), int(record['xmax']), int(record['ymax']))
+        crop_icon_img[int(record['ymin']):int(record['ymax']), int(record['xmin']):int(record['xmax'])] = (255, 255, 255)
+        list_box_yolov5.append(value)
+
+    return crop_icon_img, list_box_yolov5
+
+
 # inference all
-def process_images_in_folder(images_path, labels_path):
+def process_images_in_folder(images_path):
 
     global list_color
     global list_box_icon
-    global cnt
+    global check_used_icon
     image_files = os.listdir(images_path)
 
     for image_file in image_files:
 
-        if cnt > 0:
-            image_path = os.path.join(images_path, image_file)
+        start = time.time()
+        image_path = os.path.join(images_path, image_file)
 
-            if os.path.isfile(image_path) and image_path.lower().endswith(('png')):
+        if os.path.isfile(image_path) and image_path.lower().endswith(('png')):
 
-                input_img = cv2.imread(image_path)
-                img_name = os.path.splitext(image_file)[0]
-                label_path = os.path.join(labels_path, img_name + '.txt')
+            input_img = cv2.imread(image_path)
+            img_name = os.path.splitext(image_file)[0]
 
-                if os.path.exists(label_path):
+            list_box_icon = []
 
-                    list_box_icon = []
+            # remove all icon
+            crop_icon_image, list_box_icon = get_box_icon(image_path)
+            cv2.imwrite('crop.png', crop_icon_image)
+            if not list_box_icon:
+                print(f"image {image_file} has no icon")
+            else:  
+                check_used_icon = np.zeros(len(list_box_icon)).astype(int)
+                for color in list_color:
 
-                    # remove all icon
-                    crop_icon_image, box_icon = remove_icon(input_img, label_path)
-                    list_box_icon = box_icon
+                    list_box_text = []
 
-                    if list_box_icon[0] is None:
-                        print(f"image {image_file} has no icon")
-                    else:
-                        
-                        for color in list_color:
+                    # image for each label
+                    classification_img = color_classification(crop_icon_image, color)
+                    infor = get_text_information(classification_img) # return text coord, text
+                    if infor:
+                        list_box_text = infor
+                        value = combine_text_box3(list_box_text, img_name)
+                        txt_name = img_name + '.txt'
+                        save_xy_text(output_data, txt_name, value)
+    
+        print(f"Total time: {time.time() - start}s")
 
-                            list_box_text = []
+# images_path = '/home/minhthanh/Desktop/advanced_images/save_images/'
+# labels_path = '/home/minhthanh/Desktop/advanced_images/save_labels/'
+# output_data = '/home/minhthanh/Desktop/advanced_images/lat_long-text/'
 
-                            # image for each label
-                            classification_img = color_classification(crop_icon_image, color)
-                            infor = get_text_information(classification_img) # return text coord, text
-                            if infor:
-                                list_box_text.append(infor)
+images_path = '/home/minhthanh/Desktop/test_temp_img/'
+labels_path = '/home/minhthanh/Desktop/test_temp_label/'
+output_data = '/home/minhthanh/Desktop/lat_long_text_temp/' # save lat, long, text
+exception_path = '/home/minhthanh/Desktop/lat_long_text_temp/save_exception/'
 
-                            value = combine_text_box(list_box_text)
-                            txt_name = img_name + '.txt'
-                            save_xy_text(output_data, txt_name, value)
-
-                    cv2.waitKey(0)
-
-                else:
-                    print(f'no find label file {img_name}.txt')
-
-        cnt -= 1
-        
-    print(f"Total excute time: {time.time() - start}s")
-
-# images_path = '/home/minhthanh/Desktop/test_temp_img/' # test image
-# labels_path = '/home/minhthanh/Desktop/test_temp_label/'
-# output_data = '/home/minhthanh/Desktop/lat_long_text_temp/' # save lat, long, text
-
-images_path = '/home/minhthanh/Desktop/advanced_images/save_images/' # test image
-labels_path = '/home/minhthanh/Desktop/advanced_images/save_labels/'
-output_data = '/home/minhthanh/Desktop/advanced_images/lat_long-text/'
-
-# get list color detected
 list_color = []
 # food store
 lower_yellow = np.array([15,118,211])
@@ -297,14 +384,17 @@ upper_pink = np.array([171,224,249])
 lower_red = np.array([1,95,215])
 upper_red = np.array([3,213,237])
 
-# musume
+# musume 
 lower_greenblue = np.array([92,69,143])
 upper_greenblue = np.array([94,243,206])
 
-# bank
-lower_bank = np.array([114,90,191])
+# bank and petrol station
+lower_bank = np.array([114,89,191])
 upper_bank = np.array([117,135,222])
 
+# park 
+lower_park = np.array([68, 68, 128])
+upper_park = np.array([69, 208, 190])
 
 yellow = (lower_yellow, upper_yellow)
 blue = (lower_blue, upper_blue)
@@ -325,5 +415,5 @@ list_color.append(bank)
 # inference all
 if __name__ == "__main__":
 
-    process_images_in_folder(images_path, labels_path)
+    process_images_in_folder(images_path)
 
