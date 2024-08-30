@@ -37,7 +37,6 @@ def agument_image(bgr_image):
 def combine_box_and_text_detection(input_image):
 
     mask = np.zeros_like(input_image, dtype=np.uint8)
-
     result = ocr.ocr(input_image, cls=False)
 
     if result[0] == None:
@@ -72,7 +71,6 @@ def classify_color(input_img, color):
 
     hsv = cv2.cvtColor(input_img, cv2.COLOR_BGR2HSV)
     lower_color, upper_color = color
-
     gray_image = cv2.inRange(hsv, lower_color, upper_color)
 
     res = cv2.bitwise_and(input_img,input_img, mask= gray_image)
@@ -86,7 +84,6 @@ def classify_color(input_img, color):
 def get_text_information(input_image):
 
     list_box_text = []
-
     temp_image = input_image
     
     contours = combine_box_and_text_detection(input_image)
@@ -100,7 +97,6 @@ def get_text_information(input_image):
 
                 [X, Y, W, H] = cv2.boundingRect(contour)
                 text_coord = (X, Y, X+W, Y+H)
-
                 crop_image = temp_image[Y:(Y+H), X:(X+W)]
 
                 agument_img = agument_image(crop_image)
